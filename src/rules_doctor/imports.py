@@ -97,7 +97,7 @@ def find_imports(text: str) -> List[ImportRef]:
         if fence_char is None:
             for m in _INLINE_RE.finditer(line):
                 path = _clean_path(m.group("path"))
-                if path:
+                if _plausible_path(path):
                     refs.append(
                         ImportRef(
                             line_no=lineno,
