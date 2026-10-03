@@ -34,7 +34,8 @@ def check_shadowing(files: List[RuleFile]) -> List[Issue]:
                 "project root describing conventions, commands, and gotchas.",
             )
         )
-        return issues
+        # Keep examining the inventory: files for other ecosystems are still
+        # useful findings even when no Claude-compatible rule file exists.
 
     by_dir = {}
     for rf in files:

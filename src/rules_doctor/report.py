@@ -40,8 +40,17 @@ def checkup(root: str, read: Callable[[str], str] = _read_text) -> Report:
 
     issues: List[Issue] = []
     issues.extend(shadow.check_shadowing(files))
+    imported: List[RuleFile] = []
+    visited = set()
     for rf in loaded:
-        issues.extend(imports.check_imports(rf, root, read=read))
+        issues.extend(imports.check_imports(
+            rf, root, read=read, visited=visited, imported=imported,
+        ))
+    loaded = list({os.path.realpath(rf.path): rf for rf in loaded + imported}.values())
+    # Imported files are part of the effective loaded set and therefore of the
+    # inventory and bloat calculation, but never duplicate discovered files.
+    known = {os.path.realpath(rf.path) for rf in files}
+    report.files.extend(rf for rf in imported if os.path.realpath(rf.path) not in known)
     issues.extend(bloat.check_bloat(loaded, read=read))
 
     errors = sum(1 for i in issues if i.severity == "error")

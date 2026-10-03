@@ -152,8 +152,9 @@ def loaded_files(files: List[RuleFile]) -> List[RuleFile]:
             for rf in group:
                 if rf.kind == "agents_md":
                     shadowed.add(rf.rel)
-    return [rf for rf in files if rf.rel not in shadowed and rf.kind in (
-        "claude_md",
-        "claude_local_md",
-        "agents_md",
-    )]
+    return [
+        rf for rf in files
+        if not rf.directory
+        and rf.rel not in shadowed
+        and rf.kind in ("claude_md", "claude_local_md", "agents_md")
+    ]
