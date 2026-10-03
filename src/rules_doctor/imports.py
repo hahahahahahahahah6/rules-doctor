@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Callable, List, Set
+import stat
+from typing import Callable, List, Optional, Set
 
 from .models import ImportRef, Issue, RuleFile
 
 MAX_IMPORT_DEPTH = 4
+MAX_IMPORT_BYTES = 1024 * 1024
 
 # A directive import: a line whose first non-space token is @path.
 _DIRECTIVE_RE = re.compile(r"^\s*@(?P<path>\S+)\s*$")
@@ -27,7 +29,22 @@ _QUOTED_RE = re.compile(r'^\s*@"(?P<path>[^"]+)"\s*$')
 # Inline mention: @path/to/file.md appearing mid-line (outside fences).
 _INLINE_RE = re.compile(r"(?<![\w@`])@(?P<path>[\w][\w\-./]*\.\w[\w]*)")
 # Fence openers: ``` or ~~~ (info strings allowed).
-_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_FENCE_RE = re.compile(r"^\s*(?P<marker>`{3,}|~{3,})(?P<rest>.*)$")
+
+
+def _plausible_path(path: str) -> bool:
+    """Exclude social mentions and URLs while retaining file-like references."""
+    if not path or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", path):
+        return False
+    if path.startswith("@") or any(ch in path for ch in "<>|\0"):
+        return False
+    basename = path.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1]
+    return (
+        "/" in path
+        or "\\" in path
+        or path.startswith((".", "~"))
+        or "." in basename
+    )
 
 
 def _clean_path(raw: str) -> str:
@@ -44,30 +61,40 @@ def find_imports(text: str) -> List[ImportRef]:
     as dead imports.
     """
     refs: List[ImportRef] = []
-    in_fence = False
+    fence_char: Optional[str] = None
+    fence_length = 0
 
     for lineno, line in enumerate(text.splitlines(), start=1):
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
-            continue
+        fence = _FENCE_RE.match(line)
+        if fence:
+            marker = fence.group("marker")
+            rest = fence.group("rest")
+            if fence_char is None:
+                fence_char, fence_length = marker[0], len(marker)
+                continue
+            # A closer must use the opening character, be at least as long, and
+            # contain no info string (only optional whitespace).
+            if marker[0] == fence_char and len(marker) >= fence_length and not rest.strip():
+                fence_char, fence_length = None, 0
+                continue
 
         m = _QUOTED_RE.match(line) or _DIRECTIVE_RE.match(line)
         if m:
             raw = m.group("path")
             path = _clean_path(raw)
-            if path:
+            if _plausible_path(path):
                 refs.append(
                     ImportRef(
                         line_no=lineno,
                         raw=raw,
                         path=path,
-                        in_fence=in_fence,
+                        in_fence=fence_char is not None,
                         inline=False,
                     )
                 )
             continue
 
-        if not in_fence:
+        if fence_char is None:
             for m in _INLINE_RE.finditer(line):
                 path = _clean_path(m.group("path"))
                 if path:
@@ -85,16 +112,30 @@ def find_imports(text: str) -> List[ImportRef]:
 
 def _read_text(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        return fh.read()
+        text = fh.read(MAX_IMPORT_BYTES + 1)
+    if len(text.encode("utf-8", "replace")) > MAX_IMPORT_BYTES:
+        raise OSError("file exceeds the %d-byte import limit" % MAX_IMPORT_BYTES)
+    return text
 
 
 def check_imports(
     rule_file: RuleFile,
     root: str,
     read: Callable[[str], str] = _read_text,
+    visited: Optional[Set[str]] = None,
+    imported: Optional[List[RuleFile]] = None,
 ) -> List[Issue]:
     """Check @imports of a single loaded rule file, following nesting."""
     issues: List[Issue] = []
+    root = os.path.realpath(root)
+    if visited is None:
+        visited = set()
+    if imported is None:
+        imported = []
+    source = os.path.realpath(rule_file.path)
+    if source in visited:
+        return issues
+    visited.add(source)
     try:
         text = read(rule_file.path)
     except OSError as exc:
@@ -109,7 +150,8 @@ def check_imports(
         ]
 
     for ref in find_imports(text):
-        _check_ref(rule_file, ref, root, read, issues, chain=(), depth=1)
+        _check_ref(rule_file, ref, root, read, issues, visited, imported,
+                   chain=(source,), depth=1)
     return issues
 
 
@@ -119,6 +161,8 @@ def _check_ref(
     root: str,
     read: Callable[[str], str],
     issues: List[Issue],
+    visited: Set[str],
+    imported: List[RuleFile],
     chain: tuple,
     depth: int,
 ) -> None:
@@ -140,14 +184,20 @@ def _check_ref(
         return
 
     base_dir = os.path.dirname(rule_file.path)
-    target = os.path.normpath(os.path.join(base_dir, ref.path))
+    # realpath resolves every symlink component.  Normalize only afterward so
+    # containment is checked against the object that would actually be read.
+    target = os.path.normpath(os.path.realpath(os.path.join(base_dir, ref.path)))
 
     # 2. Escaping the project root.
-    if os.path.commonpath([root, target]) != root:
+    try:
+        escapes = os.path.commonpath([root, target]) != root
+    except ValueError:
+        escapes = True
+    if escapes:
         issues.append(
             Issue(
                 code="IMPORT_ESCAPES_ROOT",
-                severity="warning",
+                severity="error",
                 file=rule_file.rel,
                 message="Import at %s escapes the project root: '@%s'."
                 % (where, ref.raw),
@@ -155,6 +205,7 @@ def _check_ref(
                 "with the repo; use a path relative to the project root.",
             )
         )
+        return
 
     # 3. Missing / not-a-file targets.
     if not os.path.exists(target):
@@ -170,17 +221,29 @@ def _check_ref(
             )
         )
         return
-    if os.path.isdir(target):
+    try:
+        target_stat = os.stat(target)
+        mode = target_stat.st_mode
+    except OSError as exc:
+        issues.append(_unreadable(rule_file, where, ref, exc))
+        return
+    if not stat.S_ISREG(mode):
         issues.append(
             Issue(
                 code="BROKEN_IMPORT",
                 severity="error",
                 file=rule_file.rel,
-                message="Broken @import at %s: '@%s' points to a directory, not a file."
+                message="Broken @import at %s: '@%s' does not point to a regular file."
                 % (where, ref.raw),
-                fix="Point the import at a specific file inside that directory.",
+                fix="Point the import at a regular file inside the project.",
             )
         )
+        return
+    if target_stat.st_size > MAX_IMPORT_BYTES:
+        issues.append(_unreadable(
+            rule_file, where, ref,
+            OSError("file exceeds the %d-byte import limit" % MAX_IMPORT_BYTES),
+        ))
         return
 
     # 4. Nesting depth.
@@ -231,10 +294,17 @@ def _check_ref(
         )
         return
 
+    # The first traversal owns all findings and bloat for a target.  This also
+    # prevents repeated imports from multiplying work and scores.
+    if target in visited:
+        return
+    visited.add(target)
+
     # Recurse into the imported file.
     try:
         sub_text = read(target)
-    except OSError:
+    except OSError as exc:
+        issues.append(_unreadable(rule_file, where, ref, exc))
         return
     sub_file = RuleFile(
         path=target,
@@ -242,8 +312,19 @@ def _check_ref(
         kind="imported",
         directory=os.path.relpath(os.path.dirname(target), root),
     )
+    imported.append(sub_file)
     for sub_ref in find_imports(sub_text):
         _check_ref(
-            sub_file, sub_ref, root, read, issues,
+            sub_file, sub_ref, root, read, issues, visited, imported,
             chain=chain + (target,), depth=depth + 1,
         )
+
+
+def _unreadable(rule_file: RuleFile, where: str, ref: ImportRef, exc: OSError) -> Issue:
+    return Issue(
+        code="UNREADABLE_FILE",
+        severity="warning",
+        file=rule_file.rel,
+        message="Could not read @import at %s ('@%s'): %s" % (where, ref.raw, exc),
+        fix="Make sure the imported path is a readable regular UTF-8 text file.",
+    )

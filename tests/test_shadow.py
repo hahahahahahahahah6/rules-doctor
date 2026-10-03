@@ -41,6 +41,13 @@ def test_no_rule_files_info(proj):
     assert "NO_RULE_FILES" in _codes(issues)
 
 
+def test_no_rule_files_still_reports_other_ecosystem(proj):
+    root, write = proj
+    write(".cursorrules", "rules")
+    codes = _codes(shadow.check_shadowing(scanner.discover(str(root))))
+    assert {"NO_RULE_FILES", "OTHER_AGENT_RULES"} <= codes
+
+
 def test_claude_local_md_is_info(proj):
     root, write = proj
     write("CLAUDE.local.md", "# mine")
