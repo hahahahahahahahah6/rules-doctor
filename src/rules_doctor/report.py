@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import Callable, List
 
-from . import bloat, imports, scanner, shadow
+from . import bloat, imports, reliability, scanner, shadow
 from .models import Issue, Report, RuleFile
 
 ERROR_COST = 15
@@ -52,6 +52,8 @@ def checkup(root: str, read: Callable[[str], str] = _read_text) -> Report:
     known = {os.path.realpath(rf.path) for rf in files}
     report.files.extend(rf for rf in imported if os.path.realpath(rf.path) not in known)
     issues.extend(bloat.check_bloat(loaded, read=read))
+    # v0.3: ADR / scope-creep lint -- are the rules worth loading?
+    issues.extend(reliability.check_reliability(files, loaded, root, read=read))
 
     errors = sum(1 for i in issues if i.severity == "error")
     warnings = sum(1 for i in issues if i.severity == "warning")

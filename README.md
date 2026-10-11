@@ -11,6 +11,10 @@ your context window:
   directory, only `CLAUDE.md` is loaded. Your `AGENTS.md` is silently ignored.
 - **Instruction bloat** — past ~150 instruction lines, models start dropping
   or deprioritizing rules. rules-doctor tells you when you've crossed the line.
+- **v0.3 reliability lint** — contradictory directives ("always X" vs
+  "never X"), missing scope boundaries (the static proxy for scope creep),
+  weasel phrasing models ignore mid-task ("as needed", "remember to"), and
+  missing Architecture Decision Records in non-trivial projects.
 
 Zero dependencies. Pure standard library.
 
@@ -74,12 +78,29 @@ Issues (2):
 | `BLOATED_FILE` | warning | More than ~150 instruction lines in one file |
 | `BLOATED_TOTAL` | warning | All loaded rules exceed ~8000 estimated tokens |
 | `STRAY_CLAUDE_MD` / `STRAY_AGENTS_MD` | warning | Nested rule file outside the project root |
+| `CONTRADICTORY_RULES` | error | Two directives in one file say opposite things — one will be dropped mid-task |
+| `SCOPE_BOUNDARY_MISSING` | warning | No explicit scope: the file never says which files/dirs the agent may touch |
+| `VAGUE_DIRECTIVE` | warning | Weasel phrasing ("as needed", "remember to") models ignore mid-task |
+| `ADR_MISSING` | warning | Non-trivial project with no Architecture Decision Records |
 | `INLINE_IMPORT_UNCERTAIN` | info | Mid-line `@mention` may not expand like a directive line |
 | `LOCAL_OVERRIDES` | info | `CLAUDE.local.md` personal overrides noted |
 | `NO_RULE_FILES` | info | No rule files found at all |
 
 Scoring: start at 100, −15 per error, −5 per warning, floor of 0.
 Grades: A ≥ 90, B ≥ 75, C ≥ 60, D ≥ 40, F < 40.
+
+## How it differs from cost-focused doc tools
+
+[tillmeier/claude-code-guardrails](https://github.com/tillmeier/claude-code-guardrails)
+ships a `/cleanup-docs` skill that audits docs by **cost**: measure → verify →
+cut, token-greps every fact before removing text, reports in bytes. That tells
+you how *expensive* your rules are.
+
+rules-doctor checks **quality**: whether the rules are worth loading at all.
+A cheap rule file that contradicts itself, never declares a scope boundary, or
+leans on weasel phrasing will still fail you mid-task — it just fails cheaply.
+The two are complementary: run rules-doctor first to make your rules
+trustworthy, then a cost audit to make them cheap.
 
 ## Honest limitations
 
@@ -101,6 +122,12 @@ between versions. Concretely, this means:
   Model attention degrades gradually; your mileage varies by model version.
 - **Only Markdown-style rule files are understood.** `.claude/` project
   config (settings, hooks, skills) is noted but not validated.
+- **v0.3 checks are text heuristics, not a model.** Contradiction detection
+  matches opposite-polarity directives on overlapping topics — it can miss
+  subtle conflicts ("use pnpm" vs "use npm") and can misfire on quoted
+  examples. Scope-boundary detection looks for explicit scope language; an
+  unconventional-but-clear scope section may not match. ADR detection treats
+  >5 source files (or a conventional `src/`-style dir) as "non-trivial".
 
 When a finding looks suspicious, verify against the real Claude Code
 (`--debug` shows what was actually loaded). Bug reports with a minimal
